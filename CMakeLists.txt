@@ -36,6 +36,9 @@ option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
 option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
 option(MLX_BUILD_CUDA "Build cuda backend" OFF)
+option(MLX_BUILD_ANE
+       "Build experimental Apple Neural Engine execution path via MPSGraph"
+       OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
@@ -166,6 +169,10 @@ if(MLX_BUILD_CUDA)
   endif()
 endif()
 
+if(MLX_BUILD_ANE AND NOT MLX_BUILD_METAL)
+  message(FATAL_ERROR "MLX_BUILD_ANE requires MLX_BUILD_METAL=ON")
+endif()
+
 if(MLX_BUILD_METAL)
   find_library(METAL_LIB Metal)
   find_library(FOUNDATION_LIB Foundation)
@@ -237,6 +244,21 @@ if(MLX_BUILD_METAL)
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     find_library(IOKIT_LIB IOKit)
     target_link_libraries(mlx PRIVATE ${IOKIT_LIB})
+  endif()
+
+  if(MLX_BUILD_ANE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+      message(FATAL_ERROR "MLX_BUILD_ANE requires building on Darwin")
+    endif()
+    find_library(MPS_GRAPH_LIB MetalPerformanceShadersGraph)
+    if(NOT MPS_GRAPH_LIB)
+      message(
+        FATAL_ERROR
+          "MetalPerformanceShadersGraph not found. Set MLX_BUILD_ANE=OFF to build without it"
+      )
+    endif()
+    target_link_libraries(mlx PRIVATE ${MPS_GRAPH_LIB})
+    target_compile_definitions(mlx PRIVATE MLX_BUILD_ANE)
   endif()
 endif()
 

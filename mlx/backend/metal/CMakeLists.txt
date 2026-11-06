@@ -157,6 +157,13 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/resident.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
 
+if(MLX_BUILD_ANE)
+  target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compiled_ane.mm)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/compiled_ane.mm
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
 if(NOT MLX_METAL_PATH)
   set(MLX_METAL_PATH ${CMAKE_CURRENT_BINARY_DIR}/kernels/)
 endif()

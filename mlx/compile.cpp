@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <map>
@@ -11,6 +12,7 @@
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/compile.h"
 #include "mlx/compile_impl.h"
 #include "mlx/fast_primitives.h"
@@ -77,6 +79,33 @@ bool is_reduction(const Primitive& p) {
 
 bool is_fusable(const Primitive& p) {
   return is_unary(p) || is_binary(p) || is_ternary(p) || is_broadcast(p);
+}
+
+// Single Convolution nodes eligible for the ANE execution path via
+// CompiledANE; see mlx/backend/metal/compiled_ane.mm. Scoped to exactly what
+// has been validated to actually dispatch to the ANE: a plain 2D,
+// non-grouped, non-dilated, non-flipped, symmetrically-padded float16
+// convolution. Anything else falls through to the regular Metal Convolution
+// kernel.
+bool is_fusable_ane(const array& a) {
+  if (!a.has_primitive()) {
+    return false;
+  }
+  auto& prim = a.primitive();
+  if (typeid(prim) != typeid(Convolution) || a.dtype() != float16 ||
+      prim.stream().device.type != Device::gpu) {
+    return false;
+  }
+  auto& conv = static_cast<Convolution&>(prim);
+  auto [strides, padding_lo, padding_hi, kernel_dilation, input_dilation,
+        groups, flip] = conv.state();
+  if (strides.size() != 2 || groups != 1 || flip || padding_lo != padding_hi) {
+    return false;
+  }
+  auto is_all_one = [](const std::vector<int>& v) {
+    return std::all_of(v.begin(), v.end(), [](int d) { return d == 1; });
+  };
+  return is_all_one(kernel_dilation) && is_all_one(input_dilation);
 }
 
 Compiled::Compiled(
@@ -796,6 +825,60 @@ void compile_simplify(
   }
 }
 
+// Replace eligible standalone Convolution nodes with CompiledANE. Unlike
+// compile_fuse(), this never combines multiple primitives into one node: v1
+// only routes a single conv to the ANE, leaving bias/activation ops
+// untouched on the regular Metal path.
+void compile_fuse_ane(
+    std::vector<array>& tape,
+    ParentsMap& parents_map,
+    std::vector<array>& outputs) {
+  if (!metal::ane_is_available()) {
+    return;
+  }
+
+  std::unordered_map<uintptr_t, array> output_map;
+  for (auto& o : outputs) {
+    output_map.insert({o.id(), o});
+  }
+
+  std::vector<array> new_tape;
+  for (auto& arr : tape) {
+    if (!is_fusable_ane(arr)) {
+      new_tape.push_back(arr);
+      continue;
+    }
+    auto& conv = static_cast<Convolution&>(arr.primitive());
+    auto [strides, padding_lo, padding_hi, kernel_dilation, input_dilation,
+          groups, flip] = conv.state();
+
+    array new_out(
+        arr.shape(),
+        arr.dtype(),
+        std::make_shared<CompiledANE>(conv.stream(), strides, padding_lo),
+        arr.inputs());
+
+    for (auto& in : arr.inputs()) {
+      auto& pairs = parents_map[in.id()];
+      for (auto& p : pairs) {
+        if (p.first.id() == arr.id()) {
+          p.first = new_out;
+        }
+      }
+    }
+    merge_one(new_out, arr, parents_map);
+    if (auto it = output_map.find(arr.id()); it != output_map.end()) {
+      it->second = new_out;
+    }
+    new_tape.push_back(std::move(new_out));
+  }
+  tape = std::move(new_tape);
+
+  for (auto& o : outputs) {
+    o = output_map.at(o.id());
+  }
+}
+
 // Extract sub-graphs of the graph that can be compiled
 // and replace them with a Compiled Primitive.
 void compile_fuse(
@@ -1166,6 +1249,9 @@ ArrayFnWithExtra compile(
       // Kernel fusion to generate Compiled primitives. The tape and
       // new outputs must be updated accordingly
       if (mode != CompileMode::no_fuse) {
+        // Route eligible convolutions to the ANE before the regular
+        // elementwise fuser runs, so it only sees what's left.
+        compile_fuse_ane(entry.tape, parents_map, entry.outputs);
         compile_fuse(entry.tape, parents_map, entry.inputs, entry.outputs);
       }
 

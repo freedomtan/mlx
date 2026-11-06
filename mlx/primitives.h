@@ -670,6 +670,41 @@ class MLX_API Compiled : public Primitive {
   std::string kernel_lib_;
 };
 
+/*
+ * A single Convolution routed through MPSGraph with the private
+ * preferredDevice=ANE hint, instead of the regular Metal Convolution
+ * kernel. Only created by compile_fuse_ane() for 2D, unit-stride-on-groups,
+ * unit-dilation, non-flipped, symmetrically-padded, float16 convolutions; see
+ * mlx/compile.cpp. Not available in CPU-only or CUDA builds, or in Metal
+ * builds without MLX_BUILD_ANE, in which case eval_gpu throws.
+ */
+class MLX_API CompiledANE : public UnaryPrimitive {
+ public:
+  explicit CompiledANE(
+      Stream stream,
+      std::vector<int> kernel_strides,
+      std::vector<int> padding)
+      : UnaryPrimitive(stream),
+        kernel_strides_(std::move(kernel_strides)),
+        padding_(std::move(padding)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_NAME(CompiledANE)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(kernel_strides_, padding_);
+  }
+
+ private:
+  std::vector<int> kernel_strides_;
+  std::vector<int> padding_;
+};
+
 class Concatenate : public UnaryPrimitive {
  public:
   explicit Concatenate(Stream stream, int axis)
