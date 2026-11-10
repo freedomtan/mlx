@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "mlx/backend/metal/metal.h"
@@ -9,22 +10,16 @@ namespace mlx::core {
 
 bool CompiledANE::is_equivalent(const Primitive& other) const {
   const CompiledANE& a_other = static_cast<const CompiledANE&>(other);
-  return kernel_strides_ == a_other.kernel_strides_ &&
-      padding_ == a_other.padding_;
-}
-
-std::vector<Shape> CompiledANE::output_shapes(
-    const std::vector<array>& inputs) {
-  // CompiledANE wraps exactly one Convolution with groups=1, unit kernel and
-  // input dilation, and flip=false; see is_fusable_ane() in compile.cpp.
-  return {Convolution::conv_out_shape(
-      inputs[0].shape(),
-      inputs[1].shape(),
-      kernel_strides_,
-      padding_,
-      padding_,
-      /* kernel_dilation */ std::vector<int>(kernel_strides_.size(), 1),
-      /* input_dilation */ std::vector<int>(kernel_strides_.size(), 1))};
+  return std::equal(
+      tape_.begin(),
+      tape_.end(),
+      a_other.tape_.begin(),
+      a_other.tape_.end(),
+      [](const array& a1, const array& a2) {
+        auto& p1 = a1.primitive();
+        auto& p2 = a2.primitive();
+        return typeid(p1) == typeid(p2) && p1.is_equivalent(p2);
+      });
 }
 
 std::pair<std::vector<array>, std::vector<int>> CompiledANE::vmap(

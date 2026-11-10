@@ -81,19 +81,17 @@ bool is_fusable(const Primitive& p) {
   return is_unary(p) || is_binary(p) || is_ternary(p) || is_broadcast(p);
 }
 
-// Single Convolution nodes eligible for the ANE execution path via
-// CompiledANE; see mlx/backend/metal/compiled_ane.mm. Scoped to exactly what
-// has been validated to actually dispatch to the ANE: a plain 2D,
-// non-grouped, non-dilated, non-flipped, symmetrically-padded float16
-// convolution. Anything else falls through to the regular Metal Convolution
-// kernel.
-bool is_fusable_ane(const array& a) {
-  if (!a.has_primitive()) {
-    return false;
-  }
+bool is_gpu_fp16(Primitive& p, const array& a) {
+  return a.dtype() == float16 && p.stream().device.type == Device::gpu;
+}
+
+// Convolution nodes eligible to be absorbed into an ANE-fused region; see
+// mlx/backend/metal/compiled_ane.mm. Scoped to exactly what has been
+// validated to actually dispatch to the ANE: a plain 2D, non-grouped,
+// non-dilated, non-flipped, symmetrically-padded float16 convolution.
+bool is_ane_conv(const array& a) {
   auto& prim = a.primitive();
-  if (typeid(prim) != typeid(Convolution) || a.dtype() != float16 ||
-      prim.stream().device.type != Device::gpu) {
+  if (typeid(prim) != typeid(Convolution) || !is_gpu_fp16(prim, a)) {
     return false;
   }
   auto& conv = static_cast<Convolution&>(prim);
@@ -106,6 +104,46 @@ bool is_fusable_ane(const array& a) {
     return std::all_of(v.begin(), v.end(), [](int d) { return d == 1; });
   };
   return is_all_one(kernel_dilation) && is_all_one(input_dilation);
+}
+
+// A Pad node is only representable in MPSGraph if its fill value is a
+// concrete, already-materialized scalar -- MPSGraph's pad op takes a literal
+// constant, not a tensor, so the value has to be readable at fuse time, not
+// computed at run time.
+bool is_ane_pad(const array& a) {
+  auto& fill = a.inputs()[1];
+  return !fill.has_primitive() && fill.ndim() == 0 && fill.is_available();
+}
+
+// Ops that can be absorbed into an ANE-fused region alongside a convolution:
+// bias-adds, residual adds, relu (maximum(x, 0)), and the pad+slice+maximum
+// idiom mlx's pooling lowers to (see experimental/ane/resnet50_real_bench.cpp
+// max_pool_3x3_s2). Fusing the whole connected region together, instead of
+// one CompiledANE per convolution, is what makes this safe: there is no
+// non-ANE op left in between two ANE ops for a regular Metal op's output to
+// race against (see Finding 2 in experimental/ane/README.md) -- the
+// restriction that used to be needed because of that race is now implied by
+// requiring every external leaf of a region to already be synchronized (see
+// compile_fuse_ane()), not by refusing to grow the region at all.
+bool is_ane_op(const array& a) {
+  if (!a.has_primitive()) {
+    return false;
+  }
+  auto& prim = a.primitive();
+  if (typeid(prim) == typeid(Convolution)) {
+    return is_ane_conv(a);
+  }
+  if (!is_gpu_fp16(prim, a)) {
+    return false;
+  }
+  if (typeid(prim) == typeid(Add) || typeid(prim) == typeid(Maximum) ||
+      typeid(prim) == typeid(Slice)) {
+    return true;
+  }
+  if (typeid(prim) == typeid(Pad)) {
+    return is_ane_pad(a);
+  }
+  return false;
 }
 
 Compiled::Compiled(
@@ -825,13 +863,61 @@ void compile_simplify(
   }
 }
 
-// Replace eligible standalone Convolution nodes with CompiledANE. Unlike
-// compile_fuse(), this never combines multiple primitives into one node: v1
-// only routes a single conv to the ANE, leaving bias/activation ops
-// untouched on the regular Metal path.
+// mlx materializes broadcasting via an explicit Broadcast primitive rather
+// than letting Add/Maximum broadcast implicitly, so a bias or a relu's
+// scalar 0 usually arrives through a Broadcast node, not directly. Look
+// through it to find the real leaf/constant underneath -- MPSGraph's binary
+// ops broadcast on their own, so the Broadcast node itself is never needed
+// in the fused region.
+array unwrap_broadcast(const array& a) {
+  if (a.has_primitive() && typeid(a.primitive()) == typeid(Broadcast)) {
+    return a.inputs()[0];
+  }
+  return a;
+}
+
+// Tiny union-find over array ids, used only to group is_ane_op() nodes into
+// connected regions below.
+struct AneUnionFind {
+  std::unordered_map<uintptr_t, uintptr_t> parent;
+
+  uintptr_t find(uintptr_t x) {
+    auto it = parent.find(x);
+    if (it == parent.end()) {
+      parent[x] = x;
+      return x;
+    }
+    if (it->second == x) {
+      return x;
+    }
+    return it->second = find(it->second);
+  }
+
+  void unite(uintptr_t a, uintptr_t b) {
+    a = find(a);
+    b = find(b);
+    if (a != b) {
+      parent[a] = b;
+    }
+  }
+};
+
+// Replace each maximal connected region of is_ane_op() nodes with a single
+// CompiledANE, so a whole chain of convs/adds/relus/pools becomes one
+// MPSGraph dispatch instead of one per convolution. A region is only fused
+// if: it contains at least one convolution (otherwise there's nothing for
+// the ANE heuristic to place -- see is_ane_op()'s comment); it has exactly
+// one exit (one node whose value is used outside the region, so CompiledANE
+// can stay a single-output primitive); and every external leaf it reads is
+// already synchronized -- a raw graph input/constant, or the output of
+// another CompiledANE. That last rule is the same cross-queue-race guard
+// the single-conv version had (see Finding 2 in experimental/ane/README.md),
+// just checked at the region's boundary instead of at every single
+// convolution's input, since the boundary is now much further out.
 void compile_fuse_ane(
     std::vector<array>& tape,
     ParentsMap& parents_map,
+    const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   if (!metal::ane_is_available()) {
     return;
@@ -841,36 +927,171 @@ void compile_fuse_ane(
   for (auto& o : outputs) {
     output_map.insert({o.id(), o});
   }
+  // The compiled function's own call-time arguments. Everything else a
+  // fused region reads from outside itself (weights, biases) was captured
+  // by the trace and never varies across calls to this compiled function --
+  // see CompiledANE's comment in mlx/primitives.h for why that's exactly
+  // what lets those leaves be baked into the MPSGraph as compile-time
+  // constants instead of runtime placeholders.
+  std::unordered_set<uintptr_t> true_input_ids;
+  for (auto& in : inputs) {
+    true_input_ids.insert(in.id());
+  }
 
-  std::vector<array> new_tape;
+  std::unordered_set<uintptr_t> eligible;
   for (auto& arr : tape) {
-    if (!is_fusable_ane(arr)) {
-      new_tape.push_back(arr);
+    if (is_ane_op(arr)) {
+      eligible.insert(arr.id());
+    }
+  }
+
+  AneUnionFind uf;
+  for (auto& arr : tape) {
+    if (!eligible.count(arr.id())) {
       continue;
     }
-    auto& conv = static_cast<Convolution&>(arr.primitive());
-    auto [strides, padding_lo, padding_hi, kernel_dilation, input_dilation,
-          groups, flip] = conv.state();
-
-    array new_out(
-        arr.shape(),
-        arr.dtype(),
-        std::make_shared<CompiledANE>(conv.stream(), strides, padding_lo),
-        arr.inputs());
-
+    uf.find(arr.id());
     for (auto& in : arr.inputs()) {
-      auto& pairs = parents_map[in.id()];
-      for (auto& p : pairs) {
-        if (p.first.id() == arr.id()) {
-          p.first = new_out;
+      if (eligible.count(in.id())) {
+        uf.unite(arr.id(), in.id());
+      }
+    }
+  }
+
+  // Group members by component root, preserving tape (topological) order
+  // within each component.
+  std::unordered_map<uintptr_t, std::vector<array>> components;
+  for (auto& arr : tape) {
+    if (eligible.count(arr.id())) {
+      components[uf.find(arr.id())].push_back(arr);
+    }
+  }
+
+  std::unordered_set<uintptr_t> fused_away;
+  // new_out's position in the rebuilt tape has to be its region's exit
+  // node's original position: everything new_out depends on is, by
+  // construction, an ancestor of the exit node, so already ordered before
+  // it; any earlier position in the region risks landing before one of
+  // new_out's own dependencies.
+  std::unordered_map<uintptr_t, array> pending_replacement;
+
+  for (auto& [root, members] : components) {
+    if (members.size() < 2) {
+      continue;
+    }
+    bool has_conv = std::any_of(members.begin(), members.end(), [](auto& m) {
+      return typeid(m.primitive()) == typeid(Convolution);
+    });
+    if (!has_conv) {
+      continue;
+    }
+
+    std::unordered_set<uintptr_t> member_ids;
+    for (auto& m : members) {
+      member_ids.insert(m.id());
+    }
+
+    bool safe = true;
+    std::vector<array> leaf_inputs;
+    std::unordered_set<uintptr_t> leaf_ids;
+    for (auto& m : members) {
+      for (auto& raw_in : m.inputs()) {
+        array in = unwrap_broadcast(raw_in);
+        if (member_ids.count(in.id())) {
+          continue;
+        }
+        // An already-materialized scalar (relu's 0, a pad's fill value) is
+        // baked into the MPSGraph as a literal, not read from a buffer, so
+        // it never becomes a CompiledANE input and is exempt from the
+        // synchronization requirement below.
+        if (!in.has_primitive() && in.ndim() == 0 && in.is_available()) {
+          continue;
+        }
+        if (!(!in.has_primitive() ||
+              typeid(in.primitive()) == typeid(CompiledANE))) {
+          safe = false;
+        }
+        if (leaf_ids.insert(in.id()).second) {
+          leaf_inputs.push_back(in);
         }
       }
     }
-    merge_one(new_out, arr, parents_map);
-    if (auto it = output_map.find(arr.id()); it != output_map.end()) {
+    if (!safe) {
+      continue;
+    }
+
+    array* exit_node = nullptr;
+    int exit_count = 0;
+    for (auto& m : members) {
+      bool external = output_map.count(m.id()) > 0;
+      if (auto it = parents_map.find(m.id()); it != parents_map.end()) {
+        for (auto& p : it->second) {
+          if (!member_ids.count(p.first.id())) {
+            external = true;
+            break;
+          }
+        }
+      }
+      if (external) {
+        exit_count++;
+        exit_node = &m;
+      }
+    }
+    if (exit_count != 1) {
+      continue;
+    }
+
+    std::unordered_set<uintptr_t> constant_ids;
+    for (auto& leaf : leaf_inputs) {
+      if (!true_input_ids.count(leaf.id())) {
+        constant_ids.insert(leaf.id());
+      }
+    }
+
+    array new_out(
+        exit_node->shape(),
+        exit_node->dtype(),
+        std::make_shared<CompiledANE>(
+            exit_node->primitive().stream(),
+            leaf_inputs,
+            members,
+            exit_node->shape(),
+            std::move(constant_ids)),
+        leaf_inputs);
+
+    for (size_t i = 0; i < leaf_inputs.size(); i++) {
+      auto& pairs = parents_map[leaf_inputs[i].id()];
+      for (auto& p : pairs) {
+        if (member_ids.count(p.first.id())) {
+          p.first = new_out;
+          p.second = i;
+        }
+      }
+    }
+
+    for (auto& m : members) {
+      if (m.id() != exit_node->id()) {
+        fused_away.insert(m.id());
+      }
+    }
+    merge_one(new_out, *exit_node, parents_map);
+    if (auto it = output_map.find(exit_node->id()); it != output_map.end()) {
       it->second = new_out;
     }
-    new_tape.push_back(std::move(new_out));
+    pending_replacement.insert({exit_node->id(), std::move(new_out)});
+  }
+
+  std::vector<array> new_tape;
+  for (auto& arr : tape) {
+    if (auto it = pending_replacement.find(arr.id());
+        it != pending_replacement.end()) {
+      new_tape.push_back(std::move(it->second));
+      continue;
+    }
+    if (fused_away.count(arr.id())) {
+      continue;
+    }
+    new_tape.push_back(arr);
   }
   tape = std::move(new_tape);
 
@@ -1251,7 +1472,7 @@ ArrayFnWithExtra compile(
       if (mode != CompileMode::no_fuse) {
         // Route eligible convolutions to the ANE before the regular
         // elementwise fuser runs, so it only sees what's left.
-        compile_fuse_ane(entry.tape, parents_map, entry.outputs);
+        compile_fuse_ane(entry.tape, parents_map, entry.inputs, entry.outputs);
         compile_fuse(entry.tape, parents_map, entry.inputs, entry.outputs);
       }
 

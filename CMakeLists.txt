@@ -257,7 +257,14 @@ if(MLX_BUILD_METAL)
           "MetalPerformanceShadersGraph not found. Set MLX_BUILD_ANE=OFF to build without it"
       )
     endif()
-    target_link_libraries(mlx PRIVATE ${MPS_GRAPH_LIB})
+    find_library(MPS_LIB MetalPerformanceShaders)
+    if(NOT MPS_LIB)
+      message(
+        FATAL_ERROR
+          "MetalPerformanceShaders not found. Set MLX_BUILD_ANE=OFF to build without it"
+      )
+    endif()
+    target_link_libraries(mlx PRIVATE ${MPS_GRAPH_LIB} ${MPS_LIB})
     target_compile_definitions(mlx PRIVATE MLX_BUILD_ANE)
   endif()
 endif()

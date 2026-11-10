@@ -671,22 +671,44 @@ class MLX_API Compiled : public Primitive {
 };
 
 /*
- * A single Convolution routed through MPSGraph with the private
- * preferredDevice=ANE hint, instead of the regular Metal Convolution
- * kernel. Only created by compile_fuse_ane() for 2D, unit-stride-on-groups,
- * unit-dilation, non-flipped, symmetrically-padded, float16 convolutions; see
- * mlx/compile.cpp. Not available in CPU-only or CUDA builds, or in Metal
- * builds without MLX_BUILD_ANE, in which case eval_gpu throws.
+ * A fused sub-graph of Convolution/Add/Maximum/Pad/Slice ops, routed through
+ * a single MPSGraph with the private preferredDevice=ANE hint, instead of
+ * mlx's regular Metal kernels. Built by compile_fuse_ane() in
+ * mlx/compile.cpp from the largest connected region of such ops it can
+ * find with exactly one exit value; see that file for the exact
+ * eligibility rules. Running a whole region as one MPSGraph dispatch
+ * amortizes MPSGraph's per-dispatch overhead across many ops, and also
+ * removes the cross-queue race a single-conv CompiledANE had with non-ANE
+ * ops in between: there is no non-ANE op left inside a fused region.
+ *
+ * `inputs_` are the region's leaf values (the real graph inputs/weights/
+ * biases consumed from outside the region); `tape_` is the region's ops in
+ * topological order, ending in the single exit node. `constant_ids_` marks
+ * which leaves are not part of the compiled function's own argument list
+ * (model weights/biases captured by the trace, not the call-time input) --
+ * MPSGraph's private ANE placement only engages when a convolution's weight
+ * is a compile-time constant baked into the graph, not a runtime
+ * placeholder (confirmed empirically: an otherwise-identical graph with a
+ * placeholder weight silently falls back to GPU). Baking a leaf in as a
+ * constant freezes its value for the life of the compiled MPSGraph
+ * executable; this backend is inference-only (see compile_fuse_ane()) and
+ * never updates weights in place, so that's the right tradeoff here, not a
+ * correctness compromise. Not available in CPU-only or CUDA builds, or in
+ * Metal builds without MLX_BUILD_ANE, in which case eval_gpu throws.
  */
 class MLX_API CompiledANE : public UnaryPrimitive {
  public:
   explicit CompiledANE(
       Stream stream,
-      std::vector<int> kernel_strides,
-      std::vector<int> padding)
+      std::vector<array> inputs,
+      std::vector<array> tape,
+      Shape output_shape,
+      std::unordered_set<uintptr_t> constant_ids)
       : UnaryPrimitive(stream),
-        kernel_strides_(std::move(kernel_strides)),
-        padding_(std::move(padding)) {}
+        inputs_(std::move(inputs)),
+        tape_(std::move(tape)),
+        output_shape_(std::move(output_shape)),
+        constant_ids_(std::move(constant_ids)) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -695,14 +717,25 @@ class MLX_API CompiledANE : public UnaryPrimitive {
   DEFINE_GRADS()
   DEFINE_NAME(CompiledANE)
   bool is_equivalent(const Primitive& other) const override;
-  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
-  auto state() const {
-    return std::make_tuple(kernel_strides_, padding_);
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {output_shape_};
+  }
+
+  const std::vector<array>& ane_inputs() const {
+    return inputs_;
+  }
+  const std::vector<array>& tape() const {
+    return tape_;
+  }
+  bool is_constant(size_t i) const {
+    return constant_ids_.find(inputs_[i].id()) != constant_ids_.end();
   }
 
  private:
-  std::vector<int> kernel_strides_;
-  std::vector<int> padding_;
+  std::vector<array> inputs_;
+  std::vector<array> tape_;
+  Shape output_shape_;
+  std::unordered_set<uintptr_t> constant_ids_;
 };
 
 class Concatenate : public UnaryPrimitive {
