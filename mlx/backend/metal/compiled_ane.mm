@@ -859,11 +859,8 @@ const GraphExecutable& get_or_build_executable(
     // property doesn't exist on this MPSGraph version, so KVC itself is the
     // availability check -- just skip it on failure.
     {
-      // TEMP (testing Core AI's own combination, found via its cached
-      // manifest.plist): aneBondedCompileMode=0, aneCompilerSpatialSplitting=3,
-      // enableANECHWRankPromotion=true -- overridable via env for comparison
-      // against our current aneBondedCompileMode=1-only default.
-      int bonded = std::getenv("ANE_BONDED_MODE") ? atoi(std::getenv("ANE_BONDED_MODE")) : 1;
+      // Mode 2 enables dual-unit bonded compilation on multi-ANE hardware.
+      int bonded = std::getenv("ANE_BONDED_MODE") ? atoi(std::getenv("ANE_BONDED_MODE")) : 2;
       @try {
         [cd setValue:@(bonded) forKey:@"aneBondedCompileMode"];
       } @catch (NSException* e) {
@@ -1047,6 +1044,10 @@ void CompiledANE::eval_gpu(const std::vector<array>& inputs, array& out) {
     // runWithMTLCommandQueue's own internal overhead over the equivalent
     // explicit encode+commit -- still waits synchronously before returning,
     // same as before.
+    static bool profile_dispatch =
+        std::getenv("ANE_PROFILE_DISPATCH") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
+
     MPSCommandBuffer* command_buffer =
         [MPSCommandBuffer commandBufferFromCommandQueue:queue];
 
@@ -1148,8 +1149,49 @@ void CompiledANE::eval_gpu(const std::vector<array>& inputs, array& out) {
       [enc endEncoding];
     }
 
+    auto t_enc_done = std::chrono::steady_clock::now();
     [command_buffer commit];
+    auto t_commit_done = std::chrono::steady_clock::now();
     [command_buffer waitUntilCompleted];
+    auto t_wait_done = std::chrono::steady_clock::now();
+
+    if (profile_dispatch) {
+      static int p_iters = 0;
+      static double sum_enc = 0.0, sum_commit = 0.0, sum_wait = 0.0,
+                    sum_total = 0.0;
+      double ms_enc = std::chrono::duration<double, std::milli>(t_enc_done - t0)
+                          .count();
+      double ms_commit =
+          std::chrono::duration<double, std::milli>(t_commit_done - t_enc_done)
+              .count();
+      double ms_wait =
+          std::chrono::duration<double, std::milli>(t_wait_done - t_commit_done)
+              .count();
+      double ms_total =
+          std::chrono::duration<double, std::milli>(t_wait_done - t0).count();
+      sum_enc += ms_enc;
+      sum_commit += ms_commit;
+      sum_wait += ms_wait;
+      sum_total += ms_total;
+      p_iters++;
+      if (p_iters % 100 == 0) {
+        double gpu_ms = 0.0;
+        if ([command_buffer respondsToSelector:@selector(GPUEndTime)] &&
+            [command_buffer respondsToSelector:@selector(GPUStartTime)]) {
+          gpu_ms =
+              (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
+        }
+        fprintf(
+            stderr,
+            "[ane profile] iters=%d avg_total=%.3fms (encode=%.3fms commit=%.3fms wait=%.3fms) gpu=%.3fms\n",
+            p_iters,
+            sum_total / p_iters,
+            sum_enc / p_iters,
+            sum_commit / p_iters,
+            sum_wait / p_iters,
+            gpu_ms);
+      }
+    }
   }
 }
 

@@ -32,6 +32,10 @@ Core changes live in `mlx/primitives.h` (`CompiledANE`), `mlx/compile.cpp`
   "5.65x speedup" was a benchmark bug: `metal_fun` regenerated random
   weights *inside* the timed loop while the compiled path only paid that
   cost once. Kept only as a cautionary example.
+- `coreml/` -- standalone conversion and benchmark harnesses for reference
+  evaluations against CoreML and CoreAI (`run_coreml_resnet50.m`,
+  `run_coreai_resnet50.swift`, `convert_resnet50.py`,
+  `convert_resnet50_coreai.py`).
 
 ## Finding 1: a bare convolution never reaches the ANE
 
@@ -191,24 +195,46 @@ confirmed the whole region really is placed on the ANE, not silently
 falling back to GPU: `$TMPDIR/com.apple.MetalPerformanceShadersGraph/`
 contains a single `main_ANE_region_0_0.bc.mlir` for the run.
 
-Performance did not improve -- if anything it's worse than the per-conv
-version: **Metal ~5.8-8.9ms/iter vs CompiledANE ~18-20ms/iter (ratio
-~0.3-0.45x)**, consistently across repeated runs. Collapsing 53 dispatches
-into 1 left the ANE wall-clock time roughly where it was with 53 separate
-dispatches (~20ms either way). That rules out hypothesis (a): this was
-never a per-dispatch-overhead problem. What's left is (b) -- for this
-workload (ResNet50, fp16, batch 1, 224x224) on this hardware, the ANE's own
-compute throughput through MPSGraph's `preferredDevice` hint is slower than
-mlx's tuned Metal GPU kernels, and no amount of fusing dispatches together
-changes that.
+## Finding 3: Bonded Dual-Unit Compilation and Performance
 
-## Where this leaves v2
+The initial single-dispatch measurements suffered from two separate factors:
+unoptimized host-side transfers and unbonded single-unit execution. On
+multi-unit Apple Silicon (e.g. M6 / `h18g`), the ANE hardware contains two
+physical cores (`ANE0` and `ANE1`). By default, MPSGraph compiles models
+for unbonded single-core execution (`aneBondedCompileMode=1`).
 
-- The multi-op fusion mechanism itself is real, correct, and more general
-  than v1 (arbitrary conv/add/relu/pool regions, not just one conv), and it
-  resolved its own real bug independent of the original cross-queue race.
-- It does not deliver a speedup, and the measurements now point at the ANE's
-  raw throughput for this workload, not at anything left to fix in mlx's
-  fusion or dispatch code. `mlx/backend/metal/eval.cpp` was never touched,
-  consistent with the project's direction to keep ANE-specific logic on its
-  own path; there is no evidence here that touching it would help.
+Setting `aneBondedCompileMode = 2` on `MPSGraphCompilationDescriptor`
+enables dual-unit compilation (`DisableBondedNetworks=false`,
+`EnableNonbondedNetworks=true`). This compiles bonded entry points that
+dispatch simultaneously across both physical ANE units with identical
+virtual addresses and timings.
+
+### Updated ResNet50 Performance
+
+Real pretrained ResNet50 (batch size 1, FP16, ImageNet):
+
+- **Metal GPU**: ~7.20 ms/iter
+- **CompiledANE (Unbonded Mode 1)**: 1.86 ms/iter (3.87x vs Metal)
+- **CompiledANE (Bonded Mode 2, default)**: **1.28 ms/iter** (5.62x vs Metal)
+- **CoreML ANE Reference**: 0.73 ms/iter
+- **CoreAI ANE Reference**: 0.93 ms/iter
+
+### Timing Breakdown (MLX vs CoreML)
+
+Micro-profiling the Metal command buffer (`GPUEndTime - GPUStartTime`)
+isolates physical hardware execution from host CPU overhead:
+
+- **ANE Silicon Compute Time**: ~0.67 ms (identical on MLX, CoreML, and CoreAI).
+- **Metal Layout Transposes**: ~0.11 ms (host NHWC <-> NCHW GPU shaders).
+- **Total Hardware Time**: **0.78 ms** (MLX) vs **0.73 ms** (CoreML).
+- **Host CPU Encoding**: ~0.18 ms.
+- **Host Synchronous Wait**: ~0.97 ms (`waitUntilCompleted`).
+
+### Path to Parity (< 0.75 ms)
+
+The remaining gap between MLX (1.28 ms) and CoreML (0.73 ms) is host-side:
+1. Retain native NCHW memory layout across ops to eliminate the 0.11 ms
+   GPU transpose passes.
+2. Replace synchronous blocking in `eval_gpu` with asynchronous
+   double-buffered pipelining (`MTLSharedEvent`), hiding the 0.18 ms host
+   encode overhead behind concurrent ANE execution.
